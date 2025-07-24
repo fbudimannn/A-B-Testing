@@ -1,0 +1,486 @@
+---
+title: "**Advanced data analysis demo**"
+author: "Muhammad Fakhri Musyaffa Budiman/2288140"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+
+#setwd("C:/Users/daves/OneDrive/Desktop/University of Warwick/Term 2/1 - Advanced Data Analysis")
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(effectsize)
+
+```
+
+
+# Step 1. Cleaning & Data Preparation
+
+## Data Import and First Cleaning Steps
+
+```{r}
+
+# Data Import
+url <- "https://drive.google.com/uc?id=1u8gWp9pbs-XvdCxEA-HCjfVsnFgqEQJn&export=download"
+loan_data <- read_csv(url)
+ #loan_data<- read.csv("ADAproject_-5_data.csv")
+
+# Data Overview
+head(loan_data)
+
+# Specification Check
+str(loan_data)
+
+# Factor Transformation
+loan_data$Variant <- as.factor(loan_data$Variant)
+loan_data$loanofficer_id <- as.factor(loan_data$loanofficer_id)
+
+```
+
+```{r}
+
+# Duplicate Check
+sum(duplicated(loan_data))
+
+# Check if each loan officer is assigned to only one Variant
+independence_check <- loan_data %>%
+  group_by(loanofficer_id) %>%
+  summarise(num_variants = n_distinct(Variant)) %>%
+  filter(num_variants > 1)
+
+# Display result
+if (nrow(independence_check) == 0) {
+  print("Independence check passed: Each loan officer is assigned to only one group.")
+} else {
+  print("Independence check failed: Some loan officers are assigned to multiple groups.")
+  print(independence_check)
+}
+
+rm(independence_check)
+
+```
+
+```{r}
+
+# Count the number of rows per loan officer
+row_count <- loan_data %>%
+  group_by(loanofficer_id) %>%
+  summarise(num_rows = n())
+
+# Filter loan officers who don't have exactly 10 rows
+invalid_counts <- row_count %>% filter(num_rows != 10)
+
+# Display results
+if (nrow(invalid_counts) == 0) {
+  print("All loanofficer_id have exactly 10 rows.")
+} else {
+  print("Some loanofficer_id do not have exactly 10 rows:")
+  print(invalid_counts)}
+
+rm(row_count)
+rm(invalid_counts)
+
+```
+
+```{r}
+
+# Variable selection
+loan_data_filtered <- loan_data %>% 
+  select(Variant, loanofficer_id, typeI_init, typeI_fin, typeII_init, typeII_fin,
+         fully_complt, complt_init, complt_fin)
+
+# Removed variables (for the main analysis)
+  # - day: Since all loan officers have 10 rows (see check above), this variable doesn't add meaningful
+  #   information and can therefore be removed.
+  # - Agreement/Conflict Variables (agree_init, agree_fin, conflict_init, conflict_fin): These measure
+  #   how often loan officers agree or disagree with the model, but they don’t directly indicate whether
+  #   the decisions were correct or not.
+  # - Decision Revision Metrics (revised_per_ai, revised_agst_ai): These show whether loan officers changed 
+  #   their decisions but don’t reveal if those decisions were actually better.
+  # - Confidence Scores (confidence_init_total, confidence_fin_total): Confidence is subjective, a confident
+  #   loan officer can still make incorrect decisions.
+  # - AI-Performance Metrics (ai_typeI, ai_typeII): Since the goal is to evaluate loan officers' decisions
+  #   (with A/B-Testing) rather than train and evaluate the prediction model, these are not relevant to the
+  #   experiment.
+  # - Loan Counts (badloans_num, goodloans_num): Absolute counts don’t account for misclassification rates,
+  #   which are more important for evaluating decision quality.
+
+```
+
+```{r}
+
+# We exclude all rows (days) where the loan officers haven't gone through the whole company's loan review
+# procedure to ensure data comparability
+
+excluded_rows <- loan_data_filtered %>%
+  filter(fully_complt != complt_init | fully_complt != complt_fin)
+
+excluded_rows %>% 
+  filter(complt_fin == 0) %>%
+  summarise(count = n())
+  # 90 loan officers did not complete the complt_fin stage, meaning they did not use 
+  # the computer programme to make their decision.
+  # -> Note: This could also be a recording error, which needs to be verified for more accurate analysis.
+  # -> Since we have no further information, these rows will be excluded.
+
+```
+
+```{r}
+
+excluded_rows %>% 
+  filter(complt_init > complt_fin & complt_fin != 0) %>%
+  summarise(count = n())
+  # In 6 additional cases (excluding those above, where the loan officer did not use the programme at all),
+  # the loan officer did look at the programme but not for all of their decisions (complt_init > complt_fin).
+  # -> Since they did not use the programme consistently for all decisions, we also exclude these rows 
+  #    to avoid distorting our analysis.
+
+```
+
+```{r}
+
+excluded_rows %>% 
+  filter(complt_fin > complt_init) %>%
+  summarise(count = n())
+  # In 42 cases, loan officers did not make an initial decision (without the computer program) 
+  # for ALL their rejections/approvals. Since we want to ensure consistency in our comparison 
+  # (i.e. loan officers who have completed the full company loan review procedure), we have
+  # decided to exclude these rows as well.
+
+```
+
+```{r}
+
+# According to the explanations above we clean our data set
+loan_data_filtered <- loan_data_filtered %>%
+  filter(fully_complt == complt_init & fully_complt == complt_fin)
+  
+rm(excluded_rows)
+
+```
+
+```{r}
+
+# Let's check if each loan officer has a reasonable number of loan decisions to reliably calculate averages (aggr.).
+loan_data_filtered %>%
+  group_by(loanofficer_id) %>%
+  summarise(total_complt = sum(fully_complt)) %>%
+  arrange(total_complt) %>%
+  slice_head(n = 5)
+
+# The lowest number of decisions per loan_officer_id was 40, which is still sufficient to compute a
+# reasonable average (aggregated data).
+
+```
+
+```{r}
+
+# Note: Since we will build a relative OEC metric (percentage change in error), the total number of decisions
+#       made is not directly relevant. Therefore, we can remove the following three variables. 
+loan_data_filtered <- loan_data_filtered %>%
+  select(-complt_init, -complt_fin)
+
+```
+
+<br>
+
+## Aggregation
+```{r}
+
+# Aggregation of all error values per loan_officer_id (and Variant).
+# Note: Since each loan officer is assigned to only one group/variant, we could also group by
+#       loanofficer_id alone.
+loan_data_final <- loan_data_filtered %>%
+  group_by(Variant, loanofficer_id) %>%
+  summarise(total_typeI_init = sum(typeI_init),
+            total_typeI_fin = sum(typeI_fin),
+            total_typeII_init = sum(typeII_init),
+            total_typeII_fin = sum(typeII_fin),
+            fully_complt = sum(fully_complt),
+            .groups = "drop")
+
+```
+
+<br>
+<br>
+
+# Step 2: Hypothesis and OEC (Overall Evaluation Criteria) Formulation
+
+<br>
+
+## Hypothesis Formulation
+
+...
+
+<br>
+
+## OEC (Overall Evaluation Criteria) Formulation
+
+<br>
+
+**OEC:** Percentage change in error (weighted 0.25 Type I and 0.75 Type II) between the intuitive decisions (without programme insights) and the final decision (including programme insights).
+
+<br>
+
+**Explanation:**
+
+- We use the **percentage change in error (before vs. after programme insights)** as the total mean error rates (Treatment vs. Control) **before the programme insights** differ significantly (see the table below for further explanations). - These should actually be close to each other, as no different factors (such as different computer predictions) have been applied yet.
+  - _Possible Problem: Extremely small sample size._
+- **Weighting 0.75 x Type II and 0.25 x Type I**, since the company is primarily conservative and wants to avoid bad loans (focus Type II), but is still interested in not missing good loans (Type I).
+
+<br>
+
+_Note: The best approach would be to increase the sample size, with which we could potentially simplify the OEC (e.g. by only using a weighted average of the error rates). However, since we have to use the following data to conduct our A/B-Test, we tried to eliminate the identified problems._
+
+<br>
+
+```{r}
+
+# Total Mean Error Rates (Treatment vs. Control) BEFORE programme insights (should be similar)
+loan_data_final %>%
+  mutate(total_error_rate_init = (total_typeI_init + total_typeII_init)/fully_complt) %>% 
+  group_by(Variant) %>% 
+  summarise(frequency=n(), 
+            mean_total_error_rate_init=mean(total_error_rate_init))
+
+# As explained above, we observe a noticeable difference in the total mean error rates 
+# between the Control and Treatment group before programme insights. 
+# This indicates that the decision quality of the two groups was already different from the start. 
+# 
+# -> Ignoring this difference would lead to misleading conclusions when comparing errors 
+#    after using the new programme, as any observed significance could be driven by the 
+#    initial disparity in error rates rather than the programme effect itself.  
+# 
+# -> The different initial error rates are observed in the output above:  
+#    - Control: 47.8%  
+#    - Treatment: 34.2%
+
+```
+
+<br>
+
+## OEC (Overall Evaluation Criteria) Creation
+
+<br>
+
+**OEC-Creation**
+```{r}
+
+# Create our OEC (See explanation above) 
+loan_data_final <- loan_data_final %>% 
+  mutate(rel_err_change = 0.25*((total_typeI_fin-total_typeI_init)/total_typeI_init) + 
+                          0.75*((total_typeII_fin-total_typeII_init)/total_typeII_init)) %>% 
+  select(-total_typeI_init, -total_typeI_fin, -total_typeII_init, -total_typeII_fin, -fully_complt)
+```
+
+<br>
+
+**OEC-Distribution-Check and Further Data Cleaning**
+```{r}
+
+# Calculte the average error change per variant
+mean_rel_error_change <- loan_data_final %>% 
+  group_by(Variant) %>% 
+  summarise(frequency=n(), 
+            mean=mean(rel_err_change))
+
+# Histogram of the average error change per variant
+( histogram_rel_err_change_by_variant <- ggplot(loan_data_final) + 
+  geom_histogram(aes(x = rel_err_change), fill = "steelblue", binwidth = 0.15, color = "black") + 
+  geom_vline(data=mean_rel_error_change, mapping=aes(xintercept=mean), col="black") +
+  facet_grid(Variant ~ .) +
+  labs(x = "Percentage Error Change", y = "Count",
+       title = "Percentage Error Change (before vs. after programme insight)") +
+                                            theme(plot.title = element_text(hjust = 0.5,
+                                                  face = "bold")) )
+# We see one outlier (9lejzokf: increase in Error: 83%)
+
+# Explanation of the outlier and further action:
+# Type I Error Change: (16 - 50) / 50 = -68%
+# Type II Error Change: (7 - 3) / 3 = +133%
+# Weighted Error Change: 0.25 * (-68%) + 0.75 * 133% = 83%
+# -> We see a substantial increase in the weighted error, but this is mainly because the values
+#    used to compute the change are quite limited due to the small sample size.
+# -> Here, an increase in error from 3 to 7 immediately results in a very high percentage change of 133%.
+# -> As we don’t want our analysis to be overly affected by this effect, we exclude this loan officer.
+
+# Note again: Those steps are mainly made because we don't have a lot of data at hand.
+
+# As described above we exclude the loan officer "9lejzokf"
+loan_data_final <- loan_data_final %>%
+  filter(loanofficer_id != "9lejzokf")
+
+# Calculte the average error change per variant
+mean_rel_error_change <- loan_data_final %>% 
+  group_by(Variant) %>% 
+  summarise(frequency=n(), 
+            mean=mean(rel_err_change))
+
+# Histogram of the average error change per variant
+( histogram_rel_err_change_by_variant <- ggplot(loan_data_final) + 
+  geom_histogram(aes(x = rel_err_change), fill = "steelblue", binwidth = 0.15, color = "black") + 
+  geom_vline(data=mean_rel_error_change, mapping=aes(xintercept=mean), col="black") +
+  facet_grid(Variant ~ .) +
+  labs(x = "Percentage Error Change", y = "Count",
+       title = "Percentage Error Change (before vs. after programme insight)") +
+                                            theme(plot.title = element_text(hjust = 0.5,
+                                                  face = "bold")) )
+
+```
+
+<br>
+
+**First glance at the difference between Control and Treatment**
+```{r}
+
+loan_data_final %>% 
+  group_by(Variant) %>% 
+  summarise(frequency=n(), 
+            mean=mean(rel_err_change))
+
+```
+
+The Errors in the control group decreased by 1.66% after they saw the computer programme. Whereas the Errors in the Treatment group decreased by 16.5% after they saw the computer programme.
+
+**Attention:** After data cleaning, we have only 10 valid loan officers in the Control Group and 28 in the Treatment Group. This represents a very small sample size, so any further analysis must be interpreted with caution.
+
+<br>
+<br>
+
+# Step 3: Analysis
+
+<br>
+
+## Welch two-sample t-tests to examine a significant difference between 2 Variants
+
+<br>
+
+**Check the prerequisites of a t-test:**
+
+- Independence of Data: We checked that each loan Officer is allocated to only one Variant
+- Normality of Data: Our OEC-Values are approximately normally distributed
+- Continuous Data: Our OEC-Values are continuous
+
+<br>
+
+```{r}
+
+t.test(rel_err_change ~ Variant, data = loan_data_final, 
+       var.equal = FALSE)
+# With var.eual = FALSE we conduct a Welch t-test, where we assume that the samples have unequal variances
+
+```
+
+**Statistically significant**
+The mean values show us that the error in the control group, which used the old program, was reduced by 1.66%, whereas the error in the treatment group, which used the new program, was reduced by 16.48%.
+
+The two-sample independent t-test shows that the mean error rate of the control group (-1.66%) and the treatment group (-16.48%) differ significantly, indicating that the decrease in the error rate is greater in the treatment group (t(24.38) = 3.83, p < 0.001).
+
+<br>
+
+## Compute Differences in OEC (Overall Evaluation Criteria) between Variants
+
+We have examined statistical significance; now we want to assess practical significance by looking at the actual difference in OEC values and the percentage change between variants.
+
+```{r}
+
+# Compute the difference in OEC
+loan_data_final %>%
+  group_by(Variant) %>%
+  summarise(mean_rel_err_change = mean(rel_err_change)) %>%
+  summarise(Diff_Treatment_Control = mean_rel_err_change[Variant == "Treatment"] - 
+                                      mean_rel_err_change[Variant == "Control"])
+
+t.test(rel_err_change ~ Variant, data = loan_data_final, var.equal = FALSE)$conf.int
+
+```
+
+The error rate of the treatment group reduced by 14.8% (CI=[6.84%, 22.79%]) more in comparison to the control group.
+
+<br>
+
+## Compute & Interpret Effect Size (Control vs. Treatment)
+
+Effect size evaluates practical significance by measuring how large the difference between groups is relative to the data's variability.
+- Absoulte value of 0.2 or less: small, 0.3-0.5 medium, 0.8 or bigger: large effect size
+
+```{r}
+
+Control = loan_data_final$rel_err_change[loan_data_final$Variant == "Control"]
+Treatment = loan_data_final$rel_err_change[loan_data_final$Variant == "Treatment"]
+
+cohens_d(Control, Treatment) # compute the effect size of difference between Treatment 1 and Control
+effectsize::interpret_cohens_d(1.18)
+
+```
+We can see a large effect size
+
+<br>
+<br>
+
+# Step 4: Conclusion
+
+<br>
+
+## Outcome-Analysis
+The two-sample independent t-test shows that the reduction in the mean error rate of the control group (-1.66%) and the treatment group (-16.48%) differ significantly, demonstrating a greater decrease in error rate by 14.8% (CI=[6.84%, 22.79%]) in the treatment group compared to the control group (t(24.38) = 3.83, p < 0.001, d = 1.18).
+
+<br>
+
+## Recap
+When loan officers use the new prediction model in their loan review process, they can reduce their error rate to a greater extent compared to those using the old prediction model. This improvement indicates that the model is practically significant and effectively improves decision-making, resulting in more accurate loan approvals and rejections. This conclusion is supported by the conducted analysis, including the corresponding p-value and Cohen’s d measure.
+
+<br>
+
+## Limitations and Recommendations
+All results must be interpreted with caution, as the sample size was very small, and we encountered some inconsistencies in the data. While the evaluation indicates that the new model reduces the error rate to a greater extent than the old model, this should be validated with a more robust data set. Therefore, we recommend properly recollecting the data, ensuring completeness and accuracy, and slightly expanding the sample before conducting a second, more representative test run to validate the findings above.
+
+<br>
+<br>
+
+
+
+
+##----------------------- ADDITIONAL RESOURCES -----------------------##
+
+THE CODE ABOVE (STEPS 1-4) IS USED *AFTER* THE EXPERIMENT HAS BEEN RUN TO *ANALYZE THE DATA*
+HOWEVER, *BEFORE* RUNNING AN EXPERIMENT, TO *COMPUTE THE REQUIRED SAMPLE SIZE*, YOU CAN USE THE CODE BELOW:
+
+### Compute Required Sample Size for Desired Power Level of 80% and Specific Effect Size - For 2 Variants
+```{r}
+library(pwr)
+
+pwr.t.test(power = .8, # means 80% power, or probability of correctly rejecting the null hypothesis
+           d = .5, # Cohen's d (effect size)
+           sig.level = 0.05,
+           type = "two.sample") # treatment vs. control
+```
+-> *Each* group -> a bit more then 3140
+
+- if trying to detect bigger effect sizes (increase d Value) (e.g. in environments with less noise, or for small companies that need bigger changes), sample size requirements will decrease -> as we need less data (sample size) for detecting (true) big changes (large effects)
+- if reducing significance level threshold for p-val, sample size requirement will increase
+- if requiring bigger power level, sample size requirement will also increase
+
+DS:
+- Power = 80% → If the new pricing truly increases revenue, we will detect this 80% of the time.
+- α = 5% → If the new pricing actually has no effect, we will mistakenly conclude it works 5% of the time
+
+### Compute Required Sample Size for Desired Power Level of 80% and Specific Effect Size - For More Than 2 Variants
+```{r}
+required_sample_size <- pwr.anova.test(
+  k = 3,         # Number of groups (3 variants -> control vs. t1 vs. t2)
+  f = 0.05,       # Effect size (Cohen's f)
+  sig.level = 0.05,  # Significance level
+  power = 0.8    # Desired power
+)
+
+# Print the results
+print(required_sample_size)
+```
